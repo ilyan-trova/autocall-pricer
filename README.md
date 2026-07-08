@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/29817552/README.md)
+
 # Phoenix Autocall Pricer
 
 Moteur de pricing Monte Carlo pour produits structurés autocallables, développé en Python.  
