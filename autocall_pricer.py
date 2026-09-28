@@ -36,6 +36,10 @@ COUPON_MEMORY      = True                           # True = Phoenix (mémoire d
 
 RISK_FREE_RATE = 0.030    # Taux OIS EUR (proxy BCE, à actualiser selon conditions de marché)
 
+S0_EMISSION = None        # None = produit neuf (barrières calculées sur le spot courant)
+                          # Sinon: spot du sous-jacent à la date d'émission (ex: 4500.0)
+                          # -> barrières fixes en valeur absolue, Delta non nul et significatif
+
 N_SIMULATIONS = 100_000   # Trajectoires Monte Carlo
 SEED          = 42         # Graine aléatoire (assure la reproductibilité)
 
@@ -127,38 +131,40 @@ def simulate_gbm(S0, r, sigma, obs_dates):
 #  3. PAYOFF DU PHOENIX AUTOCALL
 # ============================================================
 
-def compute_payoffs(paths, S0, r, obs_dates, coupon_rate=None):
+def compute_payoffs(paths, S0, r, obs_dates, coupon_rate=None, s0_emission=None):
     """
     Payoffs actualisés et classification par scénario pour chaque trajectoire.
 
     A chaque date d'observation t_i (i = 1, ..., N):
 
-        (1) Rappel anticipé: S(t_i) >= S0 * RECALL_BARRIER
+        (1) Rappel anticipé: S(t_i) >= S0_ref * RECALL_BARRIER
             Payoff = [NOMINAL + (coupons_en_mémoire + 1) * coupon] * exp(-r * t_i)
             Le produit s'arrête. La mémoire est soldée.
 
-        (2) Coupon versé (sans rappel): S0 * COUPON_BARRIER <= S(t_i) < S0 * RECALL_BARRIER
+        (2) Coupon versé (sans rappel): S0_ref * COUPON_BARRIER <= S(t_i) < S0_ref * RECALL_BARRIER
             Payoff += (coupons_en_mémoire + 1) * coupon * exp(-r * t_i)  [si Phoenix]
             La mémoire est remise à zéro. Le produit continue.
 
-        (3) Pas de coupon: S(t_i) < S0 * COUPON_BARRIER
+        (3) Pas de coupon: S(t_i) < S0_ref * COUPON_BARRIER
             Si Phoenix: coupons_en_mémoire += 1. Si Athena: coupon perdu définitivement.
 
     A maturité (trajectoires non rappelées à aucune date):
-        - S(T) >= S0 * PROTECTION_BARRIER: remboursement intégral du NOMINAL * exp(-r*T)
-        - S(T) <  S0 * PROTECTION_BARRIER: remboursement = NOMINAL * (S(T)/S0) * exp(-r*T)
+        - S(T) >= S0_ref * PROTECTION_BARRIER: remboursement intégral du NOMINAL * exp(-r*T)
+        - S(T) <  S0_ref * PROTECTION_BARRIER: remboursement = NOMINAL * (S(T)/S0_ref) * exp(-r*T)
           Perte en capital proportionnelle à la performance négative du sous-jacent.
 
-    Note sur le Delta à l'émission: toutes les barrières sont en fraction de S0,
-    et la perte en capital est en S(T)/S0. Le produit est donc scale-invariant:
-    P(lambda*S0) = lambda*P(S0). Il s'ensuit que dP/dS0 = P/S0 (constant en %
-    du nominal), ce qui rend le Delta classique peu informatif à l'émission.
-    Pour un produit déjà en vie, les barrières sont fixes et le Delta est significatif.
+    S0_ref (référence des barrières):
+        - Produit neuf (s0_emission=None): S0_ref = S0 courant. Les barrières bougent
+          avec le spot -> scale-invariance -> Delta nul à l'émission.
+        - Produit en vie (s0_emission fourni): S0_ref = spot d'émission (fixe).
+          Les barrières sont des niveaux absolus, indépendants du spot courant.
+          Le produit n'est plus scale-invariant -> Delta significatif et non nul.
 
     Args:
         obs_dates   : dates d'observation effectives (permet le calcul du Theta)
         coupon_rate : taux de coupon à utiliser (défaut: COUPON_RATE global).
                       Paramètre exposé pour la recherche du coupon d'équilibre.
+        s0_emission : spot à la date d'émission (défaut: None = produit neuf).
 
     Returns:
         payoffs   : array (N_SIMULATIONS,) - payoffs actualisés en EUR
@@ -168,11 +174,16 @@ def compute_payoffs(paths, S0, r, obs_dates, coupon_rate=None):
     if coupon_rate is None:
         coupon_rate = COUPON_RATE
 
+    # S0_ref: référence pour le calcul des barrières absolues et de la perte en capital
+    # - Produit neuf: S0_ref = S0 courant (barrières mobiles, Delta=0)
+    # - Produit en vie: S0_ref = spot d'émission (barrières fixes, Delta!=0)
+    s0_ref = s0_emission if s0_emission is not None else S0
+
     n_sim = paths.shape[0]
 
-    level_recall      = S0 * RECALL_BARRIER
-    level_coupon      = S0 * COUPON_BARRIER
-    level_protection  = S0 * PROTECTION_BARRIER
+    level_recall      = s0_ref * RECALL_BARRIER
+    level_coupon      = s0_ref * COUPON_BARRIER
+    level_protection  = s0_ref * PROTECTION_BARRIER
 
     payoffs           = np.zeros(n_sim)
     recalled          = np.zeros(n_sim, dtype=bool)
@@ -213,7 +224,7 @@ def compute_payoffs(paths, S0, r, obs_dates, coupon_rate=None):
 
     payoffs[above] += NOMINAL * discount_T
     if below.any():
-        payoffs[below] += NOMINAL * (S_T[below] / S0) * discount_T
+        payoffs[below] += NOMINAL * (S_T[below] / s0_ref) * discount_T
 
     scenarios          = np.zeros(n_sim, dtype=int)  # 0 = rappel (par défaut)
     scenarios[above]   = 1
@@ -249,13 +260,14 @@ def price_product(paths, S0, r, obs_dates):
 #  5. GREEKS (bump-and-reval, différences finies centrées)
 # ============================================================
 
-def _price_scalar(S0, r, sigma, obs_dates, coupon_rate=None):
+def _price_scalar(S0, r, sigma, obs_dates, coupon_rate=None, s0_emission=None):
     """
     Prix scalaire pour le bump-and-reval et la recherche du coupon d'équilibre.
     Graine SEED fixe pour tous les appels: common random numbers (annulation du bruit).
     """
     paths      = simulate_gbm(S0, r, sigma, obs_dates)
-    payoffs, _ = compute_payoffs(paths, S0, r, obs_dates, coupon_rate=coupon_rate)
+    payoffs, _ = compute_payoffs(paths, S0, r, obs_dates, coupon_rate=coupon_rate,
+                                 s0_emission=s0_emission)
     return float(np.mean(payoffs))
 
 
@@ -280,21 +292,24 @@ def compute_greeks(S0, r, sigma):
     Theta [EUR/jour]: P(T - 1j) - P(T). Variation de prix pour 1 jour ouvré écoulé.
                       Toutes les dates d'observation se décalent de -1/252 an.
     """
-    # Delta
+    # Delta: on bumpe uniquement le spot courant S0 (point de départ des trajectoires).
+    # Les barrières restent fixées à S0_EMISSION si le produit est en vie,
+    # ce qui brise la scale-invariance et rend le Delta non nul et financièrement
+    # significatif. Pour un produit neuf (S0_EMISSION=None), le Delta reste ~0.
     h_S   = S0 * 0.01
-    delta = (_price_scalar(S0 + h_S, r, sigma, OBSERVATION_DATES) -
-             _price_scalar(S0 - h_S, r, sigma, OBSERVATION_DATES)) / (2 * h_S)
+    delta = (_price_scalar(S0 + h_S, r, sigma, OBSERVATION_DATES, s0_emission=S0_EMISSION) -
+             _price_scalar(S0 - h_S, r, sigma, OBSERVATION_DATES, s0_emission=S0_EMISSION)) / (2 * h_S)
 
     # Vega
     h_v  = 0.01
-    vega = (_price_scalar(S0, r, sigma + h_v, OBSERVATION_DATES) -
-            _price_scalar(S0, r, sigma - h_v, OBSERVATION_DATES)) / (2 * h_v)
+    vega = (_price_scalar(S0, r, sigma + h_v, OBSERVATION_DATES, s0_emission=S0_EMISSION) -
+            _price_scalar(S0, r, sigma - h_v, OBSERVATION_DATES, s0_emission=S0_EMISSION)) / (2 * h_v)
 
     # Theta
     dt          = 1 / 252
     obs_shifted = [t - dt for t in OBSERVATION_DATES]
-    theta       = (_price_scalar(S0, r, sigma, obs_shifted) -
-                   _price_scalar(S0, r, sigma, OBSERVATION_DATES))
+    theta       = (_price_scalar(S0, r, sigma, obs_shifted, s0_emission=S0_EMISSION) -
+                   _price_scalar(S0, r, sigma, OBSERVATION_DATES, s0_emission=S0_EMISSION))
 
     return delta, vega, theta
 
@@ -505,16 +520,31 @@ def main():
     print("\n[2] Paramètres du Phoenix Autocall")
     print(f"    Nominal           : {NOMINAL:>10,.0f} EUR")
     print(f"    Coupon            : {COUPON_RATE*100:>9.1f}% / an")
-    print(f"    Barrière rappel   : {RECALL_BARRIER*100:>9.0f}% du spot initial")
-    print(f"    Barrière coupon   : {COUPON_BARRIER*100:>9.0f}% du spot initial")
-    print(f"    Barrière prot.    : {PROTECTION_BARRIER*100:>9.0f}% du spot initial")
+
+    # Affichage des barrières en valeur absolue si produit en vie
+    s0_ref = S0_EMISSION if S0_EMISSION is not None else S0
+    if S0_EMISSION is not None:
+        print(f"    Spot d'émission   : {S0_EMISSION:>10,.2f}  (produit EN VIE | barrières fixes)")
+        print(f"    Barrière rappel   : {s0_ref*RECALL_BARRIER:>10,.2f}  ({RECALL_BARRIER*100:.0f}% de l'émission)")
+        print(f"    Barrière coupon   : {s0_ref*COUPON_BARRIER:>10,.2f}  ({COUPON_BARRIER*100:.0f}% de l'émission)")
+        print(f"    Barrière prot.    : {s0_ref*PROTECTION_BARRIER:>10,.2f}  ({PROTECTION_BARRIER*100:.0f}% de l'émission)")
+    else:
+        print(f"    Barrière rappel   : {RECALL_BARRIER*100:>9.0f}% du spot initial  (produit NEUF)")
+        print(f"    Barrière coupon   : {COUPON_BARRIER*100:>9.0f}% du spot initial")
+        print(f"    Barrière prot.    : {PROTECTION_BARRIER*100:>9.0f}% du spot initial")
+
     print(f"    Maturité max      : {OBSERVATION_DATES[-1]:>9.0f} ans")
     print(f"    Mémoire coupon    : {'Oui (Phoenix)' if COUPON_MEMORY else 'Non (Athena)'}")
 
     # 3. Simulation + pricing
     print(f"\n[3] Simulation & Pricing ({N_SIMULATIONS:,} trajectoires, variantes antithétiques)")
     paths = simulate_gbm(S0, r, sigma, OBSERVATION_DATES)
-    price, ci_low, ci_high, payoffs, scenarios = price_product(paths, S0, r, OBSERVATION_DATES)
+    payoffs_raw, scenarios = compute_payoffs(paths, S0, r, OBSERVATION_DATES,
+                                             s0_emission=S0_EMISSION)
+    n    = len(payoffs_raw)
+    mean = float(np.mean(payoffs_raw))
+    se   = float(np.std(payoffs_raw, ddof=1) / np.sqrt(n))
+    price, ci_low, ci_high, payoffs = mean, mean - 1.96*se, mean + 1.96*se, payoffs_raw
 
     print(f"    Prix Monte Carlo  : {price:>10,.4f} EUR")
     print(f"    IC 95%            :  [{ci_low:,.4f}, {ci_high:,.4f}]")
