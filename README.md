@@ -1,4 +1,3 @@
-
 # Phoenix Autocall Pricer
 
 Moteur de pricing Monte Carlo pour produits structurés autocallables, développé en Python.  
@@ -53,6 +52,7 @@ Tous les paramètres sont modifiables en tête de fichier :
 | `OBSERVATION_DATES` | [1, 2, 3, 4, 5] | Dates d'observation (en années) |
 | `COUPON_MEMORY` | True | Mémoire de coupon (Phoenix) |
 | `RISK_FREE_RATE` | 3% | Taux OIS EUR (à actualiser) |
+| `S0_EMISSION` | None | `None` = produit neuf (barrières sur spot courant). Sinon: spot à l'émission (ex: 4500) — barrières fixes, Delta non nul |
 | `N_SIMULATIONS` | 100 000 | Trajectoires Monte Carlo |
 
 ---
